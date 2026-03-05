@@ -8,6 +8,9 @@
 # USAGE:
 #   dev                    # prompts for branch; Enter with no input → current branch
 #   dev feature/my-branch  # jump straight to a branch
+#   dev kill               # interactive picker to kill a dev session
+#   dev kill feature/foo   # kill the session for a specific branch
+#   dev kill all           # kill all dev sessions
 
 set -euo pipefail
 
@@ -15,14 +18,14 @@ set -euo pipefail
 # CONFIG — override via env vars in your shell profile
 # ──────────────────────────────────────────────
 WORKTREES_DIR="${WORKTREES_DIR:-$HOME/worktrees}"
-REPO_ROOT="${REPO_ROOT:-$(git rev-parse --toplevel 2>/dev/null || echo "$PWD")}"
+REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}"
 SESSION_PREFIX="dev"
 
 # ──────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────
 die()  { echo "❌  $*" >&2; exit 1; }
-info() { echo "→  $*"; }
+info() { echo "→  $*" >&2; }
 
 require_git() {
   git rev-parse --git-dir &>/dev/null || die "Not inside a git repository."
@@ -36,6 +39,24 @@ current_branch() {
 # SPOTIFY STATUS (macOS AppleScript)
 # Written once to ~/.local/bin/tmux-spotify and called by tmux status-right
 # ──────────────────────────────────────────────
+install_timer_script() {
+  local bin_dir="$HOME/.local/bin"
+  mkdir -p "$bin_dir"
+
+  cat > "$bin_dir/tmux-uptime" << 'UPTIME'
+#!/usr/bin/env bash
+created=$(tmux display-message -p '#{session_created}' 2>/dev/null) || { echo ""; exit 0; }
+now=$(date +%s)
+elapsed=$((now - created))
+h=$((elapsed / 3600))
+m=$(( (elapsed % 3600) / 60 ))
+s=$((elapsed % 60))
+printf "⏱ %02d:%02d:%02d" "$h" "$m" "$s"
+UPTIME
+
+  chmod +x "$bin_dir/tmux-uptime"
+}
+
 install_spotify_script() {
   local bin_dir="$HOME/.local/bin"
   mkdir -p "$bin_dir"
@@ -119,7 +140,7 @@ launch_tmux() {
   local branch="$1"
   local worktree_path="$2"
   # Sanitise session name (tmux dislikes slashes)
-  local session="${SESSION_PREFIX}:${branch//\//-}"
+  local session="${SESSION_PREFIX}_${branch//\//_}"
 
   if tmux has-session -t "$session" 2>/dev/null; then
     info "Session '$session' already running — attaching."
@@ -129,9 +150,9 @@ launch_tmux() {
 
   info "Launching tmux session '$session' in $worktree_path"
 
-  tmux new-session -d -s "$session" -c "$worktree_path"
-  tmux split-window -h -t "$session" -c "$worktree_path"
-  tmux select-pane -t "$session:0.0"
+  tmux new-session -d -s "$session" -c "$worktree_path" "claude"
+  tmux split-window -h -t "$session" -c "$worktree_path" \
+    "zsh -c 'echo \"\" && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mRecent commits\033[0m                 \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && git log --oneline --decorate --color=always -3 2>/dev/null | sed \"s/^/  /\" && echo \"\" && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mtmux cheatsheet\033[0m                \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && printf \"  \033[38;5;245mCtrl-b d\033[0m    detach session\n\" && printf \"  \033[38;5;245mCtrl-b ←→\033[0m   switch pane\n\" && printf \"  \033[38;5;245mCtrl-b z\033[0m    zoom pane\n\" && printf \"  \033[38;5;245mCtrl-b c\033[0m    new window\n\" && printf \"  \033[38;5;245mCtrl-b n/p\033[0m  next/prev window\n\" && printf \"  \033[38;5;245mCtrl-b [\033[0m    scroll mode\n\" && printf \"  \033[38;5;245mCtrl-b x\033[0m    kill pane\n\" && echo \"\" && printf \"  \033[38;5;238m──────────────────────────────────\033[0m\n\" && echo \"\" && exec zsh'"
 
   # ── Status bar ──────────────────────────────
   tmux set-option -t "$session" status-interval 5
@@ -142,7 +163,10 @@ launch_tmux() {
 
   tmux set-option -t "$session" status-right-length 80
   tmux set-option -t "$session" status-right \
-    "#(tmux-spotify) #[fg=colour245]│ %H:%M "
+    "#(tmux-uptime) #[fg=colour245]│ #(tmux-spotify) #[fg=colour245]│ %H:%M "
+
+  # Enable native terminal mouse selection (bypass tmux mouse mode)
+  tmux set-option -t "$session" mouse off
 
   # Tokyo Night-ish palette
   tmux set-option -t "$session" status-style                "bg=colour235,fg=colour252"
@@ -156,9 +180,70 @@ launch_tmux() {
 }
 
 # ──────────────────────────────────────────────
+# KILL / CLEANUP
+# ──────────────────────────────────────────────
+kill_session() {
+  local branch="${1:-}"
+
+  if [[ -z "$branch" ]]; then
+    # List active dev sessions and let the user pick
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+      | grep "^${SESSION_PREFIX}_" || true)
+
+    if [[ -z "$sessions" ]]; then
+      die "No active dev sessions found."
+    fi
+
+    echo "Active dev sessions:" >&2
+    echo "$sessions" | nl -ba >&2
+    read -rp "Session to kill (name or number, 'all' to kill all): " choice
+
+    if [[ "$choice" == "all" ]]; then
+      echo "$sessions" | while read -r s; do
+        info "Killing session '$s'"
+        tmux kill-session -t "$s" 2>/dev/null || true
+      done
+      info "All dev sessions killed."
+      return
+    elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+      branch=$(echo "$sessions" | sed -n "${choice}p")
+      [[ -z "$branch" ]] && die "Invalid selection."
+      info "Killing session '$branch'"
+      tmux kill-session -t "$branch" 2>/dev/null || true
+      return
+    else
+      branch="$choice"
+    fi
+  fi
+
+  # Sanitise the same way launch_tmux does
+  local session
+  if tmux has-session -t "$branch" 2>/dev/null; then
+    session="$branch"
+  else
+    session="${SESSION_PREFIX}_${branch//\//_}"
+  fi
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux kill-session -t "$session"
+    info "Session '$session' killed."
+  else
+    die "No tmux session found for '$session'."
+  fi
+}
+
+# ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 main() {
+  # dev-kill subcommand
+  if [[ "${1:-}" == "kill" ]]; then
+    shift
+    kill_session "$@"
+    return
+  fi
+
   require_git
 
   local branch="${1:-}"
@@ -175,9 +260,21 @@ main() {
   fi
 
   install_spotify_script
+  install_timer_script
+
+  local use_worktree="n"
+  local cur
+  cur=$(current_branch)
+  if [[ "$branch" != "$cur" ]]; then
+    read -rp "Use a worktree for '$branch'? [y/N]: " use_worktree
+  fi
 
   local worktree_path
-  worktree_path=$(resolve_worktree "$branch")
+  if [[ "$use_worktree" =~ ^[Yy]$ ]]; then
+    worktree_path=$(resolve_worktree "$branch")
+  else
+    worktree_path="$REPO_ROOT"
+  fi
 
   launch_tmux "$branch" "$worktree_path"
 }
