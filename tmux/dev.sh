@@ -18,7 +18,7 @@ set -euo pipefail
 # CONFIG — override via env vars in your shell profile
 # ──────────────────────────────────────────────
 WORKTREES_DIR="${WORKTREES_DIR:-$HOME/worktrees}"
-REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}"
+REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)}"
 SESSION_PREFIX="dev"
 
 # ──────────────────────────────────────────────
@@ -121,13 +121,13 @@ resolve_worktree() {
 
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     info "Branch '$branch' exists locally — creating worktree."
-    git worktree add "$worktree_path" "$branch"
+    git worktree add "$worktree_path" "$branch" >&2
   elif git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
     info "Branch '$branch' found on remote — tracking from origin/$branch."
-    git worktree add --track -b "$branch" "$worktree_path" "origin/$branch"
+    git worktree add --track -b "$branch" "$worktree_path" "origin/$branch" >&2
   else
     info "Branch '$branch' not found — creating new branch + worktree."
-    git worktree add -b "$branch" "$worktree_path"
+    git worktree add -b "$branch" "$worktree_path" >&2
   fi
 
   echo "$worktree_path"
@@ -150,9 +150,10 @@ launch_tmux() {
 
   info "Launching tmux session '$session' in $worktree_path"
 
-  tmux new-session -d -s "$session" -c "$worktree_path" "claude"
-  tmux split-window -h -t "$session" -c "$worktree_path" \
-    "zsh -c 'echo \"\" && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mRecent commits\033[0m                 \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && git log --oneline --decorate --color=always -3 2>/dev/null | sed \"s/^/  /\" && echo \"\" && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mtmux cheatsheet\033[0m                \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && printf \"  \033[38;5;245mCtrl-b d\033[0m    detach session\n\" && printf \"  \033[38;5;245mCtrl-b ←→\033[0m   switch pane\n\" && printf \"  \033[38;5;245mCtrl-b z\033[0m    zoom pane\n\" && printf \"  \033[38;5;245mCtrl-b c\033[0m    new window\n\" && printf \"  \033[38;5;245mCtrl-b n/p\033[0m  next/prev window\n\" && printf \"  \033[38;5;245mCtrl-b [\033[0m    scroll mode\n\" && printf \"  \033[38;5;245mCtrl-b x\033[0m    kill pane\n\" && echo \"\" && printf \"  \033[38;5;238m──────────────────────────────────\033[0m\n\" && echo \"\" && exec zsh'"
+  tmux new-session -d -s "$session" -c "$worktree_path"
+  tmux send-keys -t "$session" "claude" Enter
+  tmux split-window -h -t "${session}:" -c "$worktree_path" \
+    "zsh -c 'echo \"\" && gd=\$(git rev-parse --git-dir 2>/dev/null); gc=\$(git rev-parse --git-common-dir 2>/dev/null); if [[ \"\$gd\" != \"\$gc\" ]]; then printf \"  \033[1;38;5;208m⚠ Worktree\033[0m  (linked to \$gc)\n\n\"; fi && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mRecent commits\033[0m                 \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && git log --oneline --decorate --color=always -3 2>/dev/null | sed \"s/^/  /\" && echo \"\" && printf \"  \033[1;38;5;39m┌─────────────────────────────────┐\033[0m\n\" && printf \"  \033[1;38;5;39m│\033[0m  \033[1;37mtmux cheatsheet\033[0m                \033[1;38;5;39m│\033[0m\n\" && printf \"  \033[1;38;5;39m└─────────────────────────────────┘\033[0m\n\" && echo \"\" && printf \"  \033[38;5;245mCtrl-b d\033[0m    detach session\n\" && printf \"  \033[38;5;245mCtrl-b ←→\033[0m   switch pane\n\" && printf \"  \033[38;5;245mCtrl-b z\033[0m    zoom pane\n\" && printf \"  \033[38;5;245mCtrl-b c\033[0m    new window\n\" && printf \"  \033[38;5;245mCtrl-b n/p\033[0m  next/prev window\n\" && printf \"  \033[38;5;245mCtrl-b [\033[0m    scroll mode\n\" && printf \"  \033[38;5;245mCtrl-b x\033[0m    kill pane\n\" && echo \"\" && printf \"  \033[38;5;238m──────────────────────────────────\033[0m\n\" && echo \"\" && exec zsh'"
 
   # ── Status bar ──────────────────────────────
   tmux set-option -t "$session" status-interval 5
@@ -175,6 +176,13 @@ launch_tmux() {
   tmux set-option -t "$session" pane-border-style           "fg=colour238"
   tmux set-option -t "$session" pane-active-border-style    "fg=colour39"
   tmux set-option -t "$session" window-status-current-style "fg=colour39,bold"
+
+  # Focus the Claude pane (first pane of first window)
+  local first_win
+  first_win=$(tmux list-windows -t "$session" -F '#{window_index}' | head -1)
+  local first_pane
+  first_pane=$(tmux list-panes -t "$session:$first_win" -F '#{pane_index}' | head -1)
+  tmux select-pane -t "$session:$first_win.$first_pane"
 
   tmux attach-session -t "$session"
 }
@@ -273,7 +281,7 @@ main() {
   if [[ "$use_worktree" =~ ^[Yy]$ ]]; then
     worktree_path=$(resolve_worktree "$branch")
   else
-    worktree_path="$REPO_ROOT"
+    worktree_path="$(pwd -P)"
   fi
 
   launch_tmux "$branch" "$worktree_path"
